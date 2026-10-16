@@ -1,0 +1,154 @@
+name: Sync new issues and PRs to project board
+
+# Adds newly created issues and PRs from an allowlist of repos to
+# https://github.com/orgs/asago-ai/projects/1.
+#
+# Exclusions:
+#   - repos not in the allowlist below
+#   - PRs authored by dependabot[bot]
+#
+# Requires the repo secret PROJECT_SYNC_TOKEN: a PAT with repo + project
+# (classic) or "Projects: write" org permission (fine-grained).
+#
+# The mutation addProjectV2ItemById is idempotent: items already present
+# on the board are not duplicated, so re-runs are safe.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # every 10 minutes (GitHub may delay scheduled runs)
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  ORG: asago-ai
+  PROJECT_NUMBER: "1"
+  CUTOFF_VARIABLE: PROJECT_SYNC_CUTOFF
+  GH_TOKEN: ${{ secrets.PROJECT_SYNC_TOKEN }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      # Only these repos are added to the board automatically.
+      ALLOWED_REPOS: >-
+        architecture-decision-records
+        asago-artifact-generator
+        asago-examples
+        asago-policy-mapper
+        asago-scenario-generator
+    steps:
+      - name: Sync new items to the project board
+        run: |
+          set -euo pipefail
+
+          REPO_API="repos/$ORG/.github"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # --- Resolve the project node ID -------------------------------
+          PROJECT_ID=$(gh api graphql -f query='
+            query($org: String!, $number: Int!) {
+              organization(login: $org) {
+                projectV2(number: $number) { id }
+              }
+            }' -F org="$ORG" -F number="$PROJECT_NUMBER" \
+            --jq '.data.organization.projectV2.id')
+          echo "Project ID: $PROJECT_ID"
+
+          # --- Read the cutoff timestamp ---------------------------------
+          CUTOFF=$(gh api "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
+            --jq '.value' 2>/dev/null || true)
+
+          if [ -z "$CUTOFF" ]; then
+            echo "First run: initializing cutoff to $NOW."
+            echo "No items will be added on this run."
+            gh api "$REPO_API/actions/variables" \
+              -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
+            exit 0
+          fi
+          echo "Cutoff: $CUTOFF"
+
+          # --- Collect new issues and PRs --------------------------------
+          search_items() {
+            # $1: "is:issue" or "is:pr"
+            local cursor=""
+            while :; do
+              local after=""
+              if [ -n "$cursor" ]; then after="-f after=$cursor"; fi
+              local result
+              result=$(gh api graphql \
+                -f query='
+                query($q: String!, $after: String) {
+                  search(query: $q, type: ISSUE, first: 100, after: $after) {
+                    nodes {
+                      ... on Issue {
+                        __typename id number title
+                        repository { name }
+                      }
+                      ... on PullRequest {
+                        __typename id number title
+                        author { login }
+                        repository { name }
+                      }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }' \
+                -f q="org:$ORG $1 created:>$CUTOFF" \
+                $after)
+
+              echo "$result" | jq -c '.data.search.nodes[]'
+              cursor=$(echo "$result" | jq -r '.data.search.pageInfo.endCursor')
+              if [ "$(echo "$result" | jq '.data.search.pageInfo.hasNextPage')" != "true" ]; then
+                break
+              fi
+            done
+          }
+
+          added=0
+          skipped=0
+
+          for item in $(search_items "is:issue") $(search_items "is:pr"); do
+            type=$(echo "$item" | jq -r '.__typename')
+            repo=$(echo "$item" | jq -r '.repository.name')
+            number=$(echo "$item" | jq -r '.number')
+            node_id=$(echo "$item" | jq -r '.id')
+            author=$(echo "$item" | jq -r '.author.login // "unknown"')
+
+            # Only process repos in the allowlist.
+            if ! grep -qw "$repo" <<< "$ALLOWED_REPOS"; then
+              skipped=$((skipped + 1))
+              echo "Skipping $repo#$number (repo not in allowlist)"
+              continue
+            fi
+
+            # Skip Dependabot PRs. The search API reports the login as
+            # "dependabot"; the REST/GraphQL APIs report "dependabot[bot]".
+            if [ "$type" = "PullRequest" ] \
+              && { [ "$author" = "dependabot" ] || [ "$author" = "dependabot[bot]" ]; }; then
+              skipped=$((skipped + 1))
+              echo "Skipping Dependabot PR $repo#$number"
+              continue
+            fi
+
+            gh api graphql \
+              -f query='
+              mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemById(input: {
+                  projectId: $projectId
+                  contentId: $contentId
+                }) {
+                  item { id }
+                }
+              }' \
+              -f projectId="$PROJECT_ID" -f contentId="$node_id" > /dev/null
+            echo "Added $type $repo#$number (by $author)"
+            added=$((added + 1))
+          done
+
+          echo "Added: $added, skipped: $skipped"
+
+          # --- Advance the cutoff timestamp ------------------------------
+          gh api -X PATCH "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
+            -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
+          echo "Cutoff advanced to $NOW"
