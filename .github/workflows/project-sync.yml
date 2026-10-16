@@ -18,7 +18,10 @@ on:
     - cron: "*/10 * * * *" # every 10 minutes (GitHub may delay scheduled runs)
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  # The built-in GITHUB_TOKEN manages the PROJECT_SYNC_CUTOFF variable.
+  # The PAT (PROJECT_SYNC_TOKEN) is used only for search and project
+  # mutations, because a fine-grained PAT may lack Actions-variable access.
 
 env:
   ORG: asago-ai
@@ -56,27 +59,36 @@ jobs:
           echo "Project ID: $PROJECT_ID"
 
           # --- Read the cutoff timestamp ---------------------------------
-          CUTOFF=$(gh api "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
+          # Stored via the built-in GITHUB_TOKEN, not the PAT.
+          CUTOFF=$(GH_TOKEN="$GITHUB_TOKEN" gh api \
+            "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
             --jq '.value' 2>/dev/null || true)
 
           if [ -z "$CUTOFF" ]; then
             echo "First run: initializing cutoff to $NOW."
             echo "No items will be added on this run."
-            gh api "$REPO_API/actions/variables" \
+            GH_TOKEN="$GITHUB_TOKEN" gh api "$REPO_API/actions/variables" \
               -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
             exit 0
+          fi
+
+          # Fail loudly on an unparsable cutoff instead of searching garbage.
+          if ! date -u -d "$CUTOFF" +%s > /dev/null 2>&1; then
+            echo "Invalid cutoff value: $CUTOFF" >&2
+            exit 1
           fi
           echo "Cutoff: $CUTOFF"
 
           # --- Collect new issues and PRs --------------------------------
           search_items() {
             # $1: "is:issue" or "is:pr"
-            local cursor=""
+            # Writes one JSON object per line to stdout. Returns non-zero
+            # on API failure so the caller can abort.
+            local cursor="" result
             while :; do
               local after=""
               if [ -n "$cursor" ]; then after="-f after=$cursor"; fi
-              local result
-              result=$(gh api graphql \
+              if ! result=$(gh api graphql \
                 -f query='
                 query($q: String!, $after: String) {
                   search(query: $q, type: ISSUE, first: 100, after: $after) {
@@ -95,8 +107,10 @@ jobs:
                   }
                 }' \
                 -f q="org:$ORG $1 created:>$CUTOFF" \
-                $after)
-
+                $after); then
+                echo "Search failed for $1" >&2
+                return 1
+              fi
               echo "$result" | jq -c '.data.search.nodes[]'
               cursor=$(echo "$result" | jq -r '.data.search.pageInfo.endCursor')
               if [ "$(echo "$result" | jq '.data.search.pageInfo.hasNextPage')" != "true" ]; then
@@ -108,7 +122,9 @@ jobs:
           added=0
           skipped=0
 
-          for item in $(search_items "is:issue") $(search_items "is:pr"); do
+          all_items=$( { search_items "is:issue"; search_items "is:pr"; } ) || exit 1
+
+          for item in $all_items; do
             type=$(echo "$item" | jq -r '.__typename')
             repo=$(echo "$item" | jq -r '.repository.name')
             number=$(echo "$item" | jq -r '.number')
@@ -149,6 +165,7 @@ jobs:
           echo "Added: $added, skipped: $skipped"
 
           # --- Advance the cutoff timestamp ------------------------------
-          gh api -X PATCH "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
+          GH_TOKEN="$GITHUB_TOKEN" gh api -X PATCH \
+            "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
             -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
           echo "Cutoff advanced to $NOW"
