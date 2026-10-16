@@ -1,0 +1,24 @@
+name: Keep workflows alive
+
+# GitHub automatically disables scheduled workflows after 60 days of
+# repository inactivity. This repo hosts scheduled workflows
+# (project-sync.yml, token-expiry-check.yml) but normally receives no
+# commits, so this workflow generates activity periodically to reset
+# the inactivity clock.
+#
+# The keepalive action uses the GitHub API (no commits, no checkout)
+# and only acts when the repo has been inactive.
+
+on:
+  schedule:
+    - cron: "23 4 * * 3" # weekly, Wednesday 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: gautamkrishnar/keepalive-workflow@v2
