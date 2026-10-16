@@ -44,6 +44,9 @@ jobs:
         asago-scenario-generator
     steps:
       - name: Sync new items to the project board
+        env:
+          # Built-in token, used for the cutoff variable.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
