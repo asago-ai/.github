@@ -1,0 +1,112 @@
+name: PROJECT_SYNC_TOKEN expiry check
+
+# Checks the actual expiration date of the PROJECT_SYNC_TOKEN secret by
+# reading the "github-authentication-token-expiration" response header
+# that GitHub returns for PAT-authenticated API calls. The /rate_limit
+# endpoint is used because it does not consume API quota.
+#
+# Behavior:
+#   - token expires within WARN_DAYS -> opens an issue mentioning
+#     @ABeltramo and @blastStu (a single open issue is kept; no duplicates)
+#   - token invalid or expired        -> opens an issue (same rules)
+#   - header missing                  -> non-expiring token, nothing to do
+#
+# Notes:
+#   - The issue is created with the workflow's built-in GITHUB_TOKEN, so
+#     the alert still works when PROJECT_SYNC_TOKEN is already dead.
+#   - Fine-grained PATs have been observed to report an incorrect value
+#     for this header; prefer a classic PAT for PROJECT_SYNC_TOKEN.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # every Monday 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+env:
+  WARN_DAYS: "30"
+  ALERT_ASSIGNEES: "ABeltramo,blastStu"
+  ISSUE_TITLE: "PROJECT_SYNC_TOKEN needs rotation"
+  PAT: ${{ secrets.PROJECT_SYNC_TOKEN }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token expiration and open issue if needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          REPO="$GITHUB_REPOSITORY"
+
+          open_or_update_issue() {
+            # $1: issue body
+            # Do not open a new issue if one is already open.
+            existing=$(gh issue list --repo "$REPO" --state open \
+              --search "in:title \"$ISSUE_TITLE\"" --json number --jq 'length')
+            if [ "$existing" -gt 0 ]; then
+              echo "An open \"$ISSUE_TITLE\" issue already exists. Adding a comment."
+              number=$(gh issue list --repo "$REPO" --state open \
+                --search "in:title \"$ISSUE_TITLE\"" --json number --jq '.[0].number')
+              gh issue comment "$number" --repo "$REPO" --body "$1"
+            else
+              gh issue create --repo "$REPO" \
+                --title "$ISSUE_TITLE" \
+                --assignee "$ALERT_ASSIGNEES" \
+                --body "$1"
+            fi
+          }
+
+          # --- Query the token's expiration -------------------------------
+          headers=$(curl -sS -o /dev/null -D - \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/rate_limit || true)
+
+          if [ -z "$headers" ] || ! echo "$headers" | head -1 | grep -q " 200 "; then
+            status=$(echo "$headers" | head -1 | tr -d '\r')
+            echo "Token check failed: $status"
+            open_or_update_issue "The \`PROJECT_SYNC_TOKEN\` secret in \`$REPO\` is **invalid or expired** ($status).
+
+            The project board sync workflow (\`project-sync.yml\`) cannot add items until the token is replaced.
+
+            cc @${ALERT_ASSIGNEES//,/ @}"
+            exit 0
+          fi
+
+          expiry=$(echo "$headers" | tr -d '\r' \
+            | grep -i '^github-authentication-token-expiration:' \
+            | cut -d' ' -f2-)
+
+          if [ -z "$expiry" ]; then
+            echo "No expiration header returned. Token does not expire. Nothing to do."
+            exit 0
+          fi
+
+          echo "Token expires: $expiry"
+
+          # --- Compare against today --------------------------------------
+          expiry_epoch=$(date -u -d "$expiry" +%s)
+          now_epoch=$(date -u +%s)
+          days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+          echo "Days left: $days_left"
+
+          if [ "$days_left" -le "$WARN_DAYS" ]; then
+            open_or_update_issue "The \`PROJECT_SYNC_TOKEN\` secret in \`$REPO\` expires on **$expiry** ($days_left days from now).
+
+            Renew the token and update the secret:
+
+            \`\`\`
+            gh secret set PROJECT_SYNC_TOKEN --repo $REPO
+            \`\`\`
+
+            After renewal, close this issue. If the token is not renewed in time, the project board sync workflow (\`project-sync.yml\`) will stop adding items.
+
+            cc @${ALERT_ASSIGNEES//,/ @}"
+          else
+            echo "Token is fine for more than $WARN_DAYS days. Nothing to do."
+          fi
