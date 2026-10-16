@@ -18,12 +18,7 @@ on:
     - cron: "*/10 * * * *" # every 10 minutes (GitHub may delay scheduled runs)
   workflow_dispatch:
 
-permissions:
-  # The built-in GITHUB_TOKEN manages the PROJECT_SYNC_CUTOFF variable.
-  # The PAT (PROJECT_SYNC_TOKEN) is used only for search and project
-  # mutations, because a fine-grained PAT may lack Actions-variable access.
-  contents: read
-  actions: write
+permissions: {}
 
 env:
   ORG: asago-ai
@@ -44,9 +39,6 @@ jobs:
         asago-scenario-generator
     steps:
       - name: Sync new items to the project board
-        env:
-          # Built-in token, used for the cutoff variable.
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -64,15 +56,13 @@ jobs:
           echo "Project ID: $PROJECT_ID"
 
           # --- Read the cutoff timestamp ---------------------------------
-          # Stored via the built-in GITHUB_TOKEN, not the PAT.
-          CUTOFF=$(GH_TOKEN="$GITHUB_TOKEN" gh api \
-            "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
+          CUTOFF=$(gh api "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
             --jq '.value' 2>/dev/null || true)
 
           if [ -z "$CUTOFF" ]; then
             echo "First run: initializing cutoff to $NOW."
             echo "No items will be added on this run."
-            GH_TOKEN="$GITHUB_TOKEN" gh api "$REPO_API/actions/variables" \
+            gh api "$REPO_API/actions/variables" \
               -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
             exit 0
           fi
@@ -170,7 +160,6 @@ jobs:
           echo "Added: $added, skipped: $skipped"
 
           # --- Advance the cutoff timestamp ------------------------------
-          GH_TOKEN="$GITHUB_TOKEN" gh api -X PATCH \
-            "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
+          gh api -X PATCH "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
             -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
           echo "Cutoff advanced to $NOW"
