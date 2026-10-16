@@ -18,12 +18,13 @@ on:
     - cron: "*/10 * * * *" # every 10 minutes (GitHub may delay scheduled runs)
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  # Read the workflow's own run history to determine the cutoff time.
+  actions: read
 
 env:
   ORG: asago-ai
   PROJECT_NUMBER: "1"
-  CUTOFF_VARIABLE: PROJECT_SYNC_CUTOFF
   GH_TOKEN: ${{ secrets.PROJECT_SYNC_TOKEN }}
 
 jobs:
@@ -39,6 +40,9 @@ jobs:
         asago-scenario-generator
     steps:
       - name: Sync new items to the project board
+        env:
+          # Built-in token for reading run history.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -55,22 +59,18 @@ jobs:
             --jq '.data.organization.projectV2.id')
           echo "Project ID: $PROJECT_ID"
 
-          # --- Read the cutoff timestamp ---------------------------------
-          CUTOFF=$(gh api "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
-            --jq '.value' 2>/dev/null || true)
+          # --- Determine the cutoff from the previous successful run ------
+          # Uses the workflow's own run history instead of a repo variable,
+          # so the PAT needs no Actions-variable permission. The built-in
+          # GITHUB_TOKEN provides actions:read (see permissions above).
+          CUTOFF=$(GH_TOKEN="$GITHUB_TOKEN" gh api \
+            "$REPO_API/actions/workflows/project-sync.yml/runs?status=success&per_page=1" \
+            --jq '.workflow_runs[0].run_started_at' 2>/dev/null || true)
 
-          if [ -z "$CUTOFF" ]; then
-            echo "First run: initializing cutoff to $NOW."
-            echo "No items will be added on this run."
-            gh api "$REPO_API/actions/variables" \
-              -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
+          if [ -z "$CUTOFF" ] || [ "$CUTOFF" = "null" ]; then
+            echo "No previous successful run. Only items created from now on"
+            echo "will be tracked; nothing is added on this run."
             exit 0
-          fi
-
-          # Fail loudly on an unparsable cutoff instead of searching garbage.
-          if ! date -u -d "$CUTOFF" +%s > /dev/null 2>&1; then
-            echo "Invalid cutoff value: $CUTOFF" >&2
-            exit 1
           fi
           echo "Cutoff: $CUTOFF"
 
@@ -159,7 +159,4 @@ jobs:
 
           echo "Added: $added, skipped: $skipped"
 
-          # --- Advance the cutoff timestamp ------------------------------
-          gh api -X PATCH "$REPO_API/actions/variables/$CUTOFF_VARIABLE" \
-            -f name="$CUTOFF_VARIABLE" -f value="$NOW" > /dev/null
-          echo "Cutoff advanced to $NOW"
+          echo "Done. The next run will pick up items created after $NOW."
