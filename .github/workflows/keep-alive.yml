@@ -3,11 +3,10 @@ name: Keep workflows alive
 # GitHub automatically disables scheduled workflows after 60 days of
 # repository inactivity. This repo hosts scheduled workflows
 # (project-sync.yml, token-expiry-check.yml) but normally receives no
-# commits, so this workflow generates activity periodically to reset
-# the inactivity clock.
+# commits, so this workflow pushes an empty commit if the last commit
+# is older than 45 days. This resets the inactivity clock.
 #
-# The keepalive action uses the GitHub API (no commits, no checkout)
-# and only acts when the repo has been inactive.
+# Uses only built-in git and the GITHUB_TOKEN; no third-party actions.
 
 on:
   schedule:
@@ -15,10 +14,33 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
+  contents: write
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
     steps:
-      - uses: gautamkrishnar/keepalive-workflow@v2
+      - name: Push empty commit if repo is inactive
+        run: |
+          set -euo pipefail
+
+          git clone --quiet "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+
+          last_commit_epoch=$(git log -1 --format=%ct)
+          age_days=$(( ($(date -u +%s) - last_commit_epoch) / 86400 ))
+          echo "Last commit was $age_days days ago."
+
+          if [ "$age_days" -lt 45 ]; then
+            echo "Repository is active. Nothing to do."
+            exit 0
+          fi
+
+          git config user.name "asago-automation"
+          git config user.email "noreply@github.com"
+          git commit --quiet --allow-empty \
+            -m "chore: keepalive commit to prevent workflow auto-disable"
+          git push --quiet origin main
+          echo "Pushed keepalive commit."
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
