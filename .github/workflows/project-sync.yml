@@ -90,6 +90,7 @@ jobs:
                     nodes {
                       ... on Issue {
                         __typename id number title
+                        author { login }
                         repository { name }
                       }
                       ... on PullRequest {
