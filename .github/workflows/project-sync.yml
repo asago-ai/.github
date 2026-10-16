@@ -22,6 +22,8 @@ permissions:
   # The built-in GITHUB_TOKEN manages the PROJECT_SYNC_CUTOFF variable.
   # The PAT (PROJECT_SYNC_TOKEN) is used only for search and project
   # mutations, because a fine-grained PAT may lack Actions-variable access.
+  contents: read
+  actions: write
 
 env:
   ORG: asago-ai
